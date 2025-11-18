@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>UAV As-Applied Map</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: row;
+      overflow: hidden;
+    }
+    #controls {
+      padding: 10px;
+      background: #f4f4f4;
+      width: 300px;
+      height: 100%;
+      overflow-y: auto;
+      box-sizing: border-box;
+    }
+    #map {
+      flex: 1;
+      min-width: 0;
+    }
+    .legend {
+      background: white;
+      padding: 8px 12px;
+      font-size: 13px;
+      border-radius: 4px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      max-width: 200px;
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      z-index: 1000;
+    }
+    .file-group {
+      margin-bottom: 8px;
+    }
+    .loading {
+      display: none;
+      color: #333;
+      font-weight: bold;
+    }
+    #tileURL {
+      max-width: 90%;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+    }
+    input, select, button {
+      margin-bottom: 10px;
+    }
+    .section {
+      border: 1px solid #ccc;
+      padding: 10px;
+      margin-bottom: 10px;
+      border-radius: 4px;
+      background: white;
+    }
+    .download-buttons {
+      margin-top: 10px;
+    }
+    .download-buttons button {
+      display: none;
+      margin-right: 5px;
+    }
+    h4 {
+      margin-top: 0;
+    }
+    .stats {
+      margin-top: 10px;
+      padding: 10px;
+      background: #e8f4fd;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    .stats div {
+      margin-bottom: 5px;
+    }
+  </style>
+</head>
+<body>
+<div id="controls">
+  <h3>UAV As-Applied Map Generator</h3>
+  <form id="fileForm">
+    <div class="section">
+      <label>Custom ZXY Tile Base Map:</label>
+      <input type="text" id="tileURL" placeholder="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" size="40" />
+      <label><input type="checkbox" id="customTileToggle"> Use Custom Tile Map</label>
+    </div>
+    <div class="section">
+      <label id="rateLabel">Rate Scale:</label>
+      Min: <input type="number" step="0.01" min="0" id="minRateInput" />
+      Max: <input type="number" step="0.01" min="0" id="maxRateInput" />
+      <label>Color Ramp:</label>
+      Low: <input type="color" id="lowColor" value="#ff0000" />
+      High: <input type="color" id="highColor" value="#0000FF" />
+    </div>
+    <div class="section">
+      <label>Spray Mission File (GeoJSON):</label>
+      <input type="file" id="missionUpload" accept=".kml,.geojson,.json" />
+    </div>
+    <div class="section">
+      <h4>CSV Swath Files</h4>
+      <div id="fileInputs"></div>
+      <button type="button" id="addFile">+ Add File</button>
+    </div>
+    <button type="submit" id="submitBtn">Render Map</button>
+    <div class="download-buttons">
+      <button type="button" id="downloadGeoJSONBtn">⬇️ GeoJSON</button>
+      <button type="button" id="downloadPDFBtn">⬇️ PDF</button>
+    </div>
+  </form>
+  <div id="loading" class="loading">Processing...</div>
+</div>
+<div id="map"></div>
+<div class="legend" id="legend" style="display:none;">
+  <b>Rate Legend</b> <span id="legendUnit"></span>
+  <div class="scale"></div>
+</div>
+<!-- Libraries -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-geometryutil@0.10.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://unpkg.com/@tmcw/togeojson@5.0.0/dist/togeojson.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+// Initialize map to show North Carolina
+const map = L.map('map', { maxZoom: 22 }).setView([35.2, -79.9], 7);
+let baseLayer, minRate, maxRate, missionLayer;
+const layers = [];
+let geojsonSwaths = [];
+let missionGeojson = null;
+const { jsPDF } = window.jspdf;
+// Set base tile layer
+function setBaseLayer(url) {
+  if (baseLayer) map.removeLayer(baseLayer);
+  const tileUrl = url || 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+  if (! (tileUrl.includes('{z}/{x}/{y}') || tileUrl.includes('{z}/{y}/{x}'))) {
+    alert('Invalid tile URL. It must include {z}/{x}/{y} or {z}/{y}/{x} placeholders.');
+    return false;
+  }
+  baseLayer = L.tileLayer(tileUrl, {
+    maxZoom: 22,
+    attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+  }).addTo(map);
+  return true;
+}
+setBaseLayer();
+
+// Toggle for custom tile
+document.getElementById('customTileToggle').addEventListener('change', function(e) {
+  if (e.target.checked) {
+    const url = document.getElementById('tileURL').value.trim();
+    if (!url) {
+      alert('Please enter a custom tile URL.');
+      e.target.checked = false;
+      return;
+    }
+    if (!setBaseLayer(url)) {
+      e.target.checked = false;
+    }
+  } else {
+    setBaseLayer();
+  }
+});
+
+// Utility functions
+function hexToRgb(hex) {
+  const bigint = parseInt(hex.replace('#', ''), 16);
+  return [(bigint >> 16) & 255, (bigint >> 8) & 255, bigint & 255];
+}
+function interpolateColor(c1, c2, t) {
+  const [r1, g1, b1] = hexToRgb(c1);
+  const [r2, g2, b2] = hexToRgb(c2);
+  const r = Math.round(r1 + (r2 - r1) * t);
+  const g = Math.round(g1 + (g2 - g1) * t);
+  const b = Math.round(b1 + (b2 - b1) * t);
+  return `rgb(${r},${g},${b})`;
+}
+function getColor(norm, low, high) {
+  return interpolateColor(low, high, Math.max(0, Math.min(1, norm)));
+}
+function formatRate(rate) {
+  return `${rate.toFixed(2)}`;
+}
+function updateLegend(min, max, lowColor, highColor, rateUnit) {
+  const legend = document.getElementById('legend');
+  const scale = legend.querySelector('.scale');
+  document.getElementById('legendUnit').innerHTML = `(${rateUnit})`;
+  legend.style.display = 'block';
+  const gradient = `
+    <div style="height:10px; background: linear-gradient(to right,
+      ${lowColor}, ${interpolateColor(lowColor, highColor, 0.5)}, ${highColor});"></div>
+    <div style="display:flex; justify-content:space-between;">
+      <span>${min.toFixed(1)}</span>
+      <span>${((min + max) / 2).toFixed(1)}</span>
+      <span>${max.toFixed(1)}</span>
+    </div>
+  `;
+  scale.innerHTML = gradient;
+}
+// Validate KML structure
+function validateKML(xmlDoc) {
+  const kml = xmlDoc.getElementsByTagName('kml')[0];
+  if (!kml) return 'No <kml> root element found.';
+  const document = xmlDoc.getElementsByTagName('Document')[0] || xmlDoc.getElementsByTagName('kml')[0];
+  if (!document) return 'No <Document> element found.';
+  const placemarks = document.getElementsByTagName('Placemark');
+  if (placemarks.length === 0) return 'No <Placemark> elements found.';
+  return null;
+}
+// Process mission file (KML or GeoJSON)
+function processMissionFile(file, callback) {
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    try {
+      const fileExt = file.name.split('.').pop().toLowerCase();
+      let geojson;
+      if (fileExt === 'kml') {
+        const kmlDoc = new DOMParser().parseFromString(e.target.result, 'text/xml');
+        const parserError = kmlDoc.getElementsByTagName('parsererror')[0];
+        if (parserError) throw new Error(`KML parsing error: ${parserError.textContent}`);
+        const validationError = validateKML(kmlDoc);
+        if (validationError) throw new Error(`Invalid KML structure: ${validationError}`);
+        if (typeof toGeoJSON === 'undefined') throw new Error('toGeoJSON library not loaded.');
+        geojson = toGeoJSON.kml(kmlDoc);
+      } else if (fileExt === 'geojson' || fileExt === 'json') {
+        geojson = JSON.parse(e.target.result);
+        if (!geojson.type || !['FeatureCollection', 'Feature'].includes(geojson.type)) {
+          throw new Error('Invalid GeoJSON: Must be a Feature or FeatureCollection.');
+        }
+      } else {
+        throw new Error('Unsupported file format. Use .kml or .geojson/.json.');
+      }
+      // Validate GeoJSON
+      if (!geojson.features || !Array.isArray(geojson.features)) {
+        throw new Error('GeoJSON must contain a features array.');
+      }
+      // Filter supported geometry types
+      geojson.features = geojson.features.filter(f => {
+        const validTypes = ['Point', 'LineString', 'Polygon', 'MultiPoint', 'MultiLineString', 'MultiPolygon'];
+        return f.geometry && validTypes.includes(f.geometry.type);
+      });
+      if (geojson.features.length === 0) {
+        throw new Error('No valid geometries found in the file.');
+      }
+      callback(null, geojson);
+    } catch (error) {
+      callback(error);
+    }
+  };
+  reader.onerror = () => callback(new Error('Failed to read file. Please ensure it is valid.'));
+  reader.readAsText(file);
+}
+document.getElementById('addFile').addEventListener('click', () => {
+  const div = document.createElement('div');
+  div.className = 'file-group';
+  div.innerHTML = `
+    <input type="file" accept=".csv" />
+    Width (ft): <input type="number" step="0.1" min="0.1" required />
+  `;
+  document.getElementById('fileInputs').appendChild(div);
+});
+document.getElementById('addFile').click();
+document.getElementById('fileForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const submitBtn = document.getElementById('submitBtn');
+  const loading = document.getElementById('loading');
+  submitBtn.disabled = true;
+  loading.style.display = 'block';
+  let success = false;
+  try {
+    // Handle base layer only if custom is selected
+    if (document.getElementById('customTileToggle').checked) {
+      const tileURL = document.getElementById('tileURL').value.trim();
+      if (tileURL && !setBaseLayer(tileURL)) {
+        throw new Error('Invalid tile URL.');
+      }
+    }
+    const lowColor = document.getElementById('lowColor').value;
+    const highColor = document.getElementById('highColor').value;
+    layers.forEach(l => l.remove());
+    layers.length = 0;
+    geojsonSwaths.length = 0;
+    const fileGroups = document.querySelectorAll('.file-group');
+    const allData = [];
+    const requiredColumns = ['latitude', 'longitude', 'speed(m/s)', 'flight UTC time', 'work type'];
+    let totalApplied = 0;
+    let totalAreaM2 = 0;
+    let workType;
+    const dischargeColumn = 'discharge rate(ml/min)';
+    for (const group of fileGroups) {
+      const file = group.querySelector('input[type="file"]').files[0];
+      const widthFeet = parseFloat(group.querySelector('input[type="number"]').value);
+      if (!file || isNaN(widthFeet) || widthFeet < 0.1) {
+        alert('Please provide a valid CSV file and swath width (>= 0.1 ft).');
+        continue;
+      }
+      const widthM = widthFeet * 0.3048;
+      const parsed = await new Promise((resolve, reject) => {
+        Papa.parse(file, {
+          header: true,
+          dynamicTyping: true,
+          skipEmptyLines: true,
+          quoteChar: '"',
+          complete: res => resolve(res.data),
+          error: err => reject(err)
+        });
+      });
+      const headers = Object.keys(parsed[0] || {});
+      if (!requiredColumns.every(col => headers.includes(col))) {
+        alert(`CSV file is missing required columns: ${requiredColumns.join(', ')}`);
+        continue;
+      }
+      if (!headers.includes(dischargeColumn)) {
+        alert('CSV file is missing discharge rate column ("discharge rate(ml/min)").');
+        continue;
+      }
+      const localWorkType = parsed[0]?.['work type'];
+      if (!localWorkType || !['spray', 'broadcast'].includes(localWorkType)) {
+        alert('Invalid work type in CSV: must be "spray" or "broadcast" in the "work type" column.');
+        continue;
+      }
+      if (workType === undefined) {
+        workType = localWorkType;
+      } else if (workType !== localWorkType) {
+        alert('Mixed work types in CSV files.');
+        return;
+      }
+      const data = parsed.map((row, index, arr) => {
+        const flow = parseFloat(row[dischargeColumn]);
+        const speed = parseFloat(row['speed(m/s)']);
+        let perMin, applied;
+        if (workType === 'spray') {
+          perMin = flow * 0.000264172; // ml/min to gal/min
+        } else {
+          perMin = flow * 0.00220462; // grams/min to lbs/min
+        }
+        applied = perMin * (1 / 60);
+        const minLengthM = 1.524;
+        const lengthM = Math.max(speed, minLengthM);
+        const areaM2 = lengthM * widthM;
+        const areaM2PerMin = areaM2 * 60;
+        const areaAcresPerMin = areaM2PerMin / 4046.86;
+        const rate = areaAcresPerMin > 0 ? perMin / areaAcresPerMin : 0;
+        /* Optional: Time-based calculation
+        let timeSeconds = 1;
+        if (index < arr.length - 1) {
+          const time1 = new Date(row['flight UTC time']);
+          const time2 = new Date(arr[index + 1]['flight UTC time']);
+          if (time1 && time2 && !isNaN(time1) && !isNaN(time2)) {
+            timeSeconds = (time2 - time1) / 1000;
+          }
+        }
+        applied = perMin * (timeSeconds / 60);
+        */
+        totalApplied += applied;
+        totalAreaM2 += areaM2;
+        return {
+          lat: parseFloat(row['latitude']),
+          lon: parseFloat(row['longitude']),
+          speed: speed,
+          rate: isFinite(rate) ? rate : 0,
+          time: row['flight UTC time'],
+          flow: flow,
+          lengthM: lengthM,
+          areaM2: areaM2,
+          applied: applied
+        };
+      }).filter(p => p.lat && p.lon && !isNaN(p.lat) && !isNaN(p.lon));
+      if (data.length === 0) {
+        alert('No valid data found in CSV file.');
+        continue;
+      }
+      allData.push({ data, width: widthM });
+    }
+    if (allData.length === 0) {
+      alert('No valid data to process.');
+      return;
+    }
+    if (workType === undefined) {
+      alert('No work type determined from CSV files.');
+      return;
+    }
+    const flowUnit = workType === 'spray' ? 'ml/min' : 'grams/min';
+    const rateUnit = workType === 'spray' ? 'gal/ac' : 'lbs/ac';
+    const appliedUnit = workType === 'spray' ? 'gal' : 'lbs';
+    const totalUnit = workType === 'spray' ? 'gallons' : 'pounds';
+    const allRates = allData.flatMap(d => d.data.map(p => p.rate)).filter(r => isFinite(r));
+    if (allRates.length === 0) {
+      alert('No valid rates found in the data.');
+      return;
+    }
+    minRate = parseFloat(document.getElementById('minRateInput').value) || Math.min(...allRates);
+    maxRate = parseFloat(document.getElementById('maxRateInput').value) || Math.max(...allRates);
+    if (minRate >= maxRate) {
+      alert('Minimum rate must be less than maximum rate.');
+      return;
+    }
+    const totalAcres = totalAreaM2 / 4046.86;
+    const avgRate = allRates.reduce((a, b) => a + b, 0) / allRates.length;
+    const variance = allRates.reduce((a, b) => a + Math.pow(b - avgRate, 2), 0) / allRates.length;
+    const stdDev = Math.sqrt(variance);
+    const cvPercent = (stdDev / avgRate * 100).toFixed(2);
+    for (const group of allData) {
+      const data = group.data;
+      const width = group.width;
+      const swathGroup = L.layerGroup().addTo(map);
+      for (let i = 0; i < data.length - 1; i++) {
+        const p1 = data[i];
+        const p2 = data[i + 1];
+        if (!p1 || p1.rate <= 0) continue;
+        const latlng1 = L.latLng(p1.lat, p1.lon);
+        const latlng2 = L.latLng(p2.lat, p2.lon);
+        let actualDistance = latlng1.distanceTo(latlng2);
+        const minLength = 1.524;
+        const bearing = L.GeometryUtil.bearing(latlng1, latlng2);
+        const halfWidth = width / 2;
+        let latlng2Adjusted = latlng2;
+        if (actualDistance < minLength) {
+          latlng2Adjusted = L.GeometryUtil.destination(latlng1, bearing, minLength);
+        }
+        const left1 = L.GeometryUtil.destination(latlng1, bearing - 90, halfWidth);
+        const right1 = L.GeometryUtil.destination(latlng1, bearing + 90, halfWidth);
+        const left2 = L.GeometryUtil.destination(latlng2Adjusted, bearing - 90, halfWidth);
+        const right2 = L.GeometryUtil.destination(latlng2Adjusted, bearing + 90, halfWidth);
+        const normRate = (p1.rate - minRate) / (maxRate - minRate);
+        const color = getColor(normRate, lowColor, highColor);
+        const polygon = L.polygon([left1, left2, right2, right1], {
+          color,
+          weight: 1,
+          fillOpacity: 0.7,
+          customRate: p1.rate,
+          customTime: p1.time,
+          customFlow: p1.flow,
+          customLength: p1.lengthM,
+          customArea: p1.areaM2,
+          customApplied: p1.applied,
+          zIndex: 500
+        }).addTo(swathGroup);
+        polygon.bindPopup(`
+          <b>Rate:</b> ${formatRate(p1.rate)} ${rateUnit}<br>
+          <b>Flow:</b> ${p1.flow.toFixed(2)} ${flowUnit}<br>
+          <b>Applied:</b> ${p1.applied.toFixed(4)} ${appliedUnit}<br>
+          <b>Length:</b> ${p1.lengthM.toFixed(2)} m<br>
+          <b>Width:</b> ${width.toFixed(2)} m<br>
+          <b>Area:</b> ${p1.areaM2.toFixed(2)} m²<br>
+          <b>Time:</b> ${p1.time}
+        `);
+        geojsonSwaths.push({
+          type: 'Feature',
+          geometry: {
+            type: 'Polygon',
+            coordinates: [[
+              [left1.lng, left1.lat],
+              [left2.lng, left2.lat],
+              [right2.lng, right2.lat],
+              [right1.lng, right1.lat],
+              [left1.lng, left1.lat]
+            ]]
+          },
+          properties: {
+            rate: p1.rate,
+            flow: p1.flow,
+            applied: p1.applied,
+            length: p1.lengthM,
+            width: width,
+            area: p1.areaM2,
+            time: p1.time,
+            unit: rateUnit
+          }
+        });
+      }
+      layers.push(swathGroup);
+    }
+    const allCoords = allData.flatMap(d => d.data.map(p => [p.lat, p.lon]));
+    if (allCoords.length) {
+      map.fitBounds(L.latLngBounds(allCoords), { maxZoom: 18 });
+    }
+    if (missionLayer) {
+      missionLayer.bringToBack();
+    }
+    updateLegend(minRate, maxRate, lowColor, highColor, rateUnit);
+    // Update stats display
+    let statsHtml = `
+      <div class="stats">
+        <b>Summary Statistics:</b><br>
+        <div>Total Applied: ${totalApplied.toFixed(2)} ${totalUnit}</div>
+        <div>Total Area: ${totalAcres.toFixed(2)} acres</div>
+        <div>Avg Rate: ${avgRate.toFixed(2)} ${rateUnit}</div>
+        <div>%CV: ${cvPercent}%</div>
+      </div>
+    `;
+    const totalDisplay = document.getElementById('totalApplied');
+    if (totalDisplay) {
+      totalDisplay.innerHTML = statsHtml;
+    } else {
+      const newStats = document.createElement('div');
+      newStats.id = 'totalApplied';
+      newStats.innerHTML = statsHtml;
+      document.getElementById('controls').appendChild(newStats);
+    }
+    success = true;
+  } catch (error) {
+    alert(`Error processing data: ${error.message}`);
+  } finally {
+    submitBtn.disabled = false;
+    loading.style.display = 'none';
+    if (success) {
+      document.getElementById('downloadGeoJSONBtn').style.display = 'inline-block';
+      document.getElementById('downloadPDFBtn').style.display = 'inline-block';
+    }
+  }
+});
+document.getElementById('downloadGeoJSONBtn').addEventListener('click', () => {
+  if (!geojsonSwaths.length) {
+    alert('No as-applied data to export.');
+    return;
+  }
+  const geojsonExport = {
+    type: 'FeatureCollection',
+    features: geojsonSwaths,
+    metadata: {
+      tileURL: document.getElementById('tileURL').value,
+      lowColor: document.getElementById('lowColor').value,
+      highColor: document.getElementById('highColor').value,
+      minRate: minRate,
+      maxRate: maxRate,
+      unit: geojsonSwaths[0].properties.unit,
+      created: new Date().toISOString()
+    }
+  };
+  const blob = new Blob([JSON.stringify(geojsonExport, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `as_applied_${new Date().toISOString().split('T')[0]}.geojson`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+document.getElementById('downloadPDFBtn').addEventListener('click', async () => {
+  try {
+    const rateUnit = geojsonSwaths[0]?.properties.unit || '';
+    const flowUnit = rateUnit === 'gal/ac' ? 'ml/min' : 'grams/min';
+    const appliedUnit = rateUnit === 'gal/ac' ? 'gal' : 'lbs';
+    const totalUnit = rateUnit === 'gal/ac' ? 'gallons' : 'pounds';
+    const totalApplied = geojsonSwaths.reduce((sum, feature) => sum + (feature.properties.applied || 0), 0);
+    const totalAreaM2 = geojsonSwaths.reduce((sum, feature) => sum + (feature.properties.area || 0), 0);
+    const totalAcres = totalAreaM2 / 4046.86;
+    const allRates = geojsonSwaths.map(f => f.properties.rate).filter(r => isFinite(r));
+    const avgRate = allRates.reduce((a, b) => a + b, 0) / allRates.length;
+    const variance = allRates.reduce((a, b) => a + Math.pow(b - avgRate, 2), 0) / allRates.length;
+    const stdDev = Math.sqrt(variance);
+    const cvPercent = (stdDev / avgRate * 100).toFixed(2);
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    let yOffset = 10;
+    doc.setFontSize(16);
+    doc.text('UAV As-Applied Map Report', 10, yOffset);
+    yOffset += 10;
+    doc.setFontSize(12);
+    doc.text(`Date: ${new Date().toISOString().split('T')[0]}`, 10, yOffset);
+    yOffset += 10;
+    doc.setFontSize(14);
+    doc.text('Summary Statistics', 10, yOffset);
+    yOffset += 7;
+    doc.setFontSize(10);
+    doc.text(`Total Applied: ${totalApplied.toFixed(2)} ${totalUnit}`, 10, yOffset);
+    yOffset += 5;
+    doc.text(`Total Area: ${totalAcres.toFixed(2)} acres`, 10, yOffset);
+    yOffset += 5;
+    doc.text(`Average Rate: ${avgRate.toFixed(2)} ${rateUnit}`, 10, yOffset);
+    yOffset += 5;
+    doc.text(`%CV: ${cvPercent}%`, 10, yOffset);
+    yOffset += 10;
+    doc.setFontSize(14);
+    doc.text('Basemap Information', 10, yOffset);
+    yOffset += 7;
+    doc.setFontSize(10);
+    const tileURL = document.getElementById('tileURL').value || 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+    doc.text(`Tile URL: ${tileURL}`, 10, yOffset);
+    yOffset += 5;
+    doc.text('Attribution: Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community', 10, yOffset);
+    yOffset += 10;
+    doc.setFontSize(14);
+    doc.text('Map Visualization', 10, yOffset);
+    yOffset += 7;
+    doc.setFontSize(10);
+    try {
+      const mapElement = document.getElementById('map');
+      const canvas = await html2canvas(mapElement, { useCORS: true, scale: 2 });
+      const imgData = canvas.toDataURL('image/png');
+      const imgWidth = 190;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      if (yOffset + imgHeight > 270) {
+        doc.addPage();
+        yOffset = 10;
+      }
+      doc.addImage(imgData, 'PNG', 10, yOffset, imgWidth, imgHeight);
+      yOffset += imgHeight + 10;
+    } catch (error) {
+      doc.text('Note: Map visualization could not be captured.', 10, yOffset);
+      yOffset += 10;
+    }
+    doc.setFontSize(14);
+    doc.text('Spray Mission Data', 10, yOffset);
+    yOffset += 7;
+    if (missionGeojson && missionGeojson.features && missionGeojson.features.length > 0) {
+      doc.setFontSize(10);
+      doc.text('Name | Type | Coordinates', 10, yOffset);
+      yOffset += 5;
+      missionGeojson.features.forEach(feature => {
+        if (yOffset > 270) {
+          doc.addPage();
+          yOffset = 10;
+        }
+        const name = feature.properties.name || 'Unnamed';
+        let type = (feature.properties.type || 'Unknown').toLowerCase();
+        if (type === 'nospray') type = 'no-spray';
+        const coords = feature.geometry.coordinates[0]?.map(c => `(${c[0]?.toFixed(4) || 'N/A'}, ${c[1]?.toFixed(4) || 'N/A'})`)?.join(', ') || 'N/A';
+        const text = `${name} | ${type} | ${coords.substring(0, 50)}...`;
+        doc.text(text, 10, yOffset);
+        yOffset += 5;
+      });
+      yOffset += 5;
+    } else {
+      doc.setFontSize(10);
+      doc.text('No mission data loaded.', 10, yOffset);
+      yOffset += 10;
+    }
+    doc.setFontSize(14);
+    doc.text('As-Applied Data', 10, yOffset);
+    yOffset += 7;
+    if (geojsonSwaths.length > 0) {
+      doc.setFontSize(10);
+      doc.text(`Rate (${rateUnit}) | Flow (${flowUnit}) | Applied (${appliedUnit}) | Length (m) | Width (m) | Area (m²) | Time | Coordinates`, 10, yOffset);
+      yOffset += 5;
+      geojsonSwaths.forEach(feature => {
+        if (yOffset > 270) {
+          doc.addPage();
+          yOffset = 10;
+        }
+        const coords = feature.geometry.coordinates[0].map(c => `(${c[0].toFixed(4)}, ${c[1].toFixed(4)})`).join(', ');
+        const text = `${feature.properties.rate.toFixed(2)} | ${feature.properties.flow.toFixed(2)} | ${feature.properties.applied.toFixed(4)} | ${feature.properties.length.toFixed(2)} | ${feature.properties.width.toFixed(2)} | ${feature.properties.area.toFixed(2)} | ${feature.properties.time} | ${coords.substring(0, 30)}...`;
+        doc.text(text, 10, yOffset);
+        yOffset += 5;
+      });
+    } else {
+      doc.setFontSize(10);
+      doc.text('No as-applied data loaded.', 10, yOffset);
+      yOffset += 10;
+    }
+    doc.save(`as_applied_report_${new Date().toISOString().split('T')[0]}.pdf`);
+  } catch (error) {
+    alert(`Error generating PDF: ${error.message}`);
+  }
+});
+document.getElementById('missionUpload').addEventListener('change', function (e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  processMissionFile(file, (error, geojson) => {
+    if (error) {
+      alert(`Error processing mission file: ${error.message}`);
+      return;
+    }
+    try {
+      if (missionLayer) {
+        map.removeLayer(missionLayer);
+      }
+      missionGeojson = geojson;
+      missionLayer = L.geoJSON(geojson, {
+        style: { color: 'red', weight: 3, fillOpacity: 0 },
+        onEachFeature: function (feature, layer) {
+          const name = feature.properties.name || 'Unnamed';
+          let type = (feature.properties.type || 'Unknown').toLowerCase();
+          if (type === 'nospray') type = 'no-spray';
+          layer.bindPopup(`<b>${name}</b><br>Type: ${type}`);
+        },
+        zIndexOffset: 1000
+      }).addTo(map);
+      try {
+        map.fitBounds(missionLayer.getBounds(), { maxZoom: 18 });
+      } catch (boundsError) {
+        alert('Warning: Could not zoom to mission data bounds. Invalid or empty bounds.');
+      }
+    } catch (error) {
+      alert(`Error rendering mission data: ${error.message}`);
+    }
+  });
+});
+</script>
+</body>
+</html>
